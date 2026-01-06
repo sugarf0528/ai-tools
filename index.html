@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 批量生成工具</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .task-card { height: 300px; display: flex; flex-direction: column; transition: all 0.3s ease; }
+        .media-box { height: 200px; background-color: #f3f4f6; display: flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 0.5rem; }
+        video, img { max-height: 100%; max-width: 100%; object-fit: contain; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+
+    <div class="flex flex-col md:flex-row h-screen">
+        <div class="w-full md:w-80 bg-white shadow-xl p-6 overflow-y-auto z-10">
+            <h1 class="text-xl font-bold mb-6">⚙️ 控制中心</h1>
+            
+            <input type="password" id="apiKey" class="w-full p-2 mb-4 border rounded text-sm" placeholder="输入 API KEY">
+
+            <div class="flex space-x-2 mb-6">
+                <button onclick="switchTab('video')" id="tabBtn-video" class="flex-1 py-2 text-sm rounded bg-blue-600 text-white">视频生成</button>
+                <button onclick="switchTab('draw')" id="tabBtn-draw" class="flex-1 py-2 text-sm rounded bg-gray-200">AI 绘画</button>
+            </div>
+
+            <div class="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-100">
+                <label class="block text-xs font-bold text-blue-600 mb-1">生成数量 (1-20)</label>
+                <input type="number" id="batchCount" min="1" max="20" value="1" class="w-full p-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+            </div>
+
+            <div id="panel-video" class="space-y-4">
+                <select id="vRatio" class="w-full p-2 border rounded text-sm">
+                    <option value="9:16">比例 9:16</option>
+                    <option value="16:9">比例 16:9</option>
+                </select>
+                <input type="file" id="vFile" class="text-xs w-full">
+            </div>
+
+            <div id="panel-draw" class="hidden space-y-4">
+                <select id="dModel" class="w-full p-2 border rounded text-sm">
+                    <option value="nano-banana-pro">nano-banana-pro</option>
+                    <option value="nano-banana-fast">nano-banana-fast</option>
+                </select>
+                <input type="file" id="dFiles" class="text-xs w-full" multiple>
+            </div>
+
+            <textarea id="prompt" class="w-full p-2 border rounded h-24 mt-4 text-sm" placeholder="输入提示词..."></textarea>
+            
+            <button onclick="startBatchTasks()" class="w-full py-3 mt-4 bg-indigo-600 text-white rounded-lg font-bold hover:bg-indigo-700 shadow-lg active:scale-95 transition">🚀 批量开启生成</button>
+            
+            <button onclick="clearHistory()" class="w-full py-2 mt-8 text-xs text-red-400 hover:text-red-600">🗑️ 清空所有历史记录</button>
+        </div>
+
+        <div class="flex-1 p-6 overflow-y-auto">
+            <h2 class="text-lg font-bold text-slate-700 mb-6">📋 任务队列</h2>
+            <div id="taskGrid" class="grid grid-cols-1 lg:grid-cols-3 2xl:grid-cols-5 gap-6"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentTab = 'video';
+        let tasks = JSON.parse(localStorage.getItem('grsai_tasks')) || [];
+        const API_HOST = "https://grsai.dakka.com.cn";
+
+        window.onload = () => {
+            renderAllTasks();
+            tasks.forEach(t => { if(t.status === 'running') pollResult(t.realId, t.id); });
+        };
+
+        function switchTab(tab) {
+            currentTab = tab;
+            document.getElementById('panel-video').classList.toggle('hidden', tab !== 'video');
+            document.getElementById('panel-draw').classList.toggle('hidden', tab !== 'draw');
+            document.getElementById('tabBtn-video').className = tab === 'video' ? 'flex-1 py-2 text-sm rounded bg-blue-600 text-white' : 'flex-1 py-2 text-sm rounded bg-gray-200';
+            document.getElementById('tabBtn-draw').className = tab === 'draw' ? 'flex-1 py-2 text-sm rounded bg-blue-600 text-white' : 'flex-1 py-2 text-sm rounded bg-gray-200';
+        }
+
+        // --- 批量执行逻辑 ---
+        async function startBatchTasks() {
+            const count = parseInt(document.getElementById('batchCount').value) || 1;
+            const key = document.getElementById('apiKey').value;
+            const prompt = document.getElementById('prompt').value;
+
+            if(!key || !prompt) return alert("请填写 KEY 和 提示词");
+
+            // 预处理图片
+            let base64Img = null;
+            let base64ImgList = [];
+            if (currentTab === 'video') {
+                const file = document.getElementById('vFile').files[0];
+                if(file) base64Img = await fileToBase64(file);
+            } else {
+                const files = document.getElementById('dFiles').files;
+                if(files.length > 0) base64ImgList = await Promise.all(Array.from(files).map(f => fileToBase64(f)));
+            }
+
+            // 循环发送请求
+            for (let i = 0; i < count; i++) {
+                const taskId = "task_" + Date.now() + "_" + i;
+                const taskObj = { id: taskId, prompt, status: 'running', progress: 0, url: null, type: currentTab };
+                
+                // 保存并渲染
+                saveTask(taskObj);
+                renderAllTasks();
+
+                // 立即发起请求 (不用 await 阻塞，实现并行)
+                callApi(taskId, prompt, base64Img, base64ImgList, key);
+                
+                // 稍微延迟一点点，防止接口 QPS 过载
+                await new Promise(r => setTimeout(r, 300));
+            }
+        }
+
+        async function callApi(taskId, prompt, base64Img, base64ImgList, key) {
+            let endpoint = currentTab === 'video' ? "/v1/video/sora-video" : "/v1/draw/nano-banana";
+            let payload = { prompt, webHook: "-1" };
+
+            if (currentTab === 'video') {
+                payload.model = "sora-2";
+                payload.aspectRatio = document.getElementById('vRatio').value;
+                payload.duration = 10;
+                if(base64Img) payload.url = base64Img;
+            } else {
+                payload.model = document.getElementById('dModel').value;
+                payload.aspectRatio = "1:1";
+                if(base64ImgList.length > 0) payload.urls = base64ImgList;
+            }
+
+            try {
+                const res = await fetch(API_HOST + endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if(data.code === 0) {
+                    updateTaskData(taskId, { realId: data.data.id });
+                    pollResult(data.data.id, taskId);
+                } else {
+                    updateTaskData(taskId, { status: 'failed', error: data.msg });
+                    renderAllTasks();
+                }
+            } catch (e) {
+                updateTaskData(taskId, { status: 'failed' });
+                renderAllTasks();
+            }
+        }
+
+        function pollResult(realId, cardId) {
+            const key = document.getElementById('apiKey').value;
+            const timer = setInterval(async () => {
+                const res = await fetch(API_HOST + "/v1/draw/result", {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+                    body: JSON.stringify({ id: realId })
+                });
+                const resData = await res.json();
+                if(resData.code !== 0) return;
+
+                const info = resData.data;
+                updateTaskData(cardId, { progress: info.progress });
+                const bar = document.getElementById(`bar-${cardId}`);
+                if(bar) bar.style.width = info.progress + "%";
+
+                if(info.status === "succeeded") {
+                    clearInterval(timer);
+                    const finalUrl = info.results[0].url;
+                    updateTaskData(cardId, { status: 'succeeded', url: finalUrl });
+                    renderAllTasks();
+                    autoDownload(finalUrl, cardId);
+                } else if(info.status === "failed") {
+                    clearInterval(timer);
+                    updateTaskData(cardId, { status: 'failed' });
+                    renderAllTasks();
+                }
+            }, 4000); // 批量生成时建议轮询间隔稍微长一点
+        }
+
+        // --- 以下为数据管理函数 (保持不变) ---
+        function saveTask(t) { tasks.unshift(t); localStorage.setItem('grsai_tasks', JSON.stringify(tasks)); }
+        function updateTaskData(id, newData) { tasks = tasks.map(t => t.id === id ? {...t, ...newData} : t); localStorage.setItem('grsai_tasks', JSON.stringify(tasks)); }
+        function renderAllTasks() {
+            const grid = document.getElementById('taskGrid');
+            grid.innerHTML = tasks.map(t => `
+                <div class="task-card bg-white p-4 rounded-lg shadow-sm border border-slate-200">
+                    <div class="flex justify-between text-[10px] text-slate-400 mb-2">
+                        <span>${t.type === 'video' ? '🎥 视频' : '🎨 绘画'}</span>
+                        <span class="${t.status==='succeeded'?'text-green-500':'text-blue-500'} font-bold">${t.status.toUpperCase()}</span>
+                    </div>
+                    <p class="text-xs font-medium mb-2 truncate text-slate-600">${t.prompt}</p>
+                    <div class="media-box">
+                        ${t.status === 'succeeded' 
+                            ? (t.url.includes('.mp4') ? `<video src="${t.url}" controls></video>` : `<img src="${t.url}">`)
+                            : `<div class="w-full px-6">
+                                <div class="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                                    <div id="bar-${t.id}" class="bg-blue-500 h-1.5 rounded-full transition-all duration-500" style="width: ${t.progress}%"></div>
+                                </div>
+                                <p class="text-[10px] text-center mt-2 text-slate-400 font-mono">${t.progress}%</p>
+                               </div>`
+                        }
+                    </div>
+                    ${t.status === 'succeeded' ? `<div class="mt-2 text-[10px] text-green-600 font-medium">✨ 已自动保存</div>` : ''}
+                </div>
+            `).join('');
+        }
+        function clearHistory() { if(confirm("确定清空记录吗？")) { tasks=[]; localStorage.removeItem('grsai_tasks'); renderAllTasks(); } }
+        async function fileToBase64(file) { return new Promise(r => { const f=new FileReader(); f.onload=()=>r(f.result); f.readAsDataURL(file); }); }
+        async function autoDownload(url, filename) {
+            try {
+                const res = await fetch(url);
+                const blob = await res.blob();
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = filename + (url.includes('.mp4') ? '.mp4' : '.jpg');
+                a.click();
+            } catch (e) { window.open(url, '_blank'); }
+        }
+    </script>
+</body>
+</html>
